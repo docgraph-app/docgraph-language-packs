@@ -1,0 +1,30 @@
+{
+  "nouns": {
+    "what": "German nouns: gender, every case form, singular and plural",
+    "url": "https://raw.githubusercontent.com/gambolputty/german-nouns/da71a2bc519b952b28c9b0b80971cff6efb508f6/german_nouns/nouns.csv",
+    "file": "nouns.csv",
+    "sha256": "7b34ca76bb753fa5d3d2b683ecc987824ae874b375ac999a797074fafba2768e",
+    "size": 20194356,
+    "origin": "German Wiktionary, via github.com/gambolputty/german-nouns (commit da71a2b)",
+    "licence": "CC BY-SA 4.0"
+  },
+  "senses": {
+    "what": "German-English meanings: numbered senses, German definition, English translations",
+    "url": "https://download.wikdict.com/dictionaries/sqlite/2/de-en.sqlite3",
+    "file": "de-en.sqlite3",
+    "sha256": "7100de12c97e700f42414e7bf9c2b1801f812970c0bc62873927011acf29e6e8",
+    "size": 26505216,
+    "origin": "Wiktionary via DBnary, packaged by WikDict (www.wikdict.com), build of 2026-06-23",
+    "licence": "CC BY-SA"
+  },
+  "verbs": {
+    "what": "German verbs: conjugation, Perfekt auxiliary, separable prefix",
+    "url": "https://kaikki.org/dewiktionary/raw-wiktextract-data.jsonl.gz",
+    "file": "raw-wiktextract-data.jsonl.gz",
+    "sha256": "a432d4233f979ea3bbd82ca34b192ad51e4404d32f222b99a8080adaeb69a037",
+    "size": 310139416,
+    "origin": "German Wiktionary dump of 2026-10-01, extracted 2026-10-24 by wiktextract (kaikki.org)",
+    "licence": "CC BY-SA 4.0",
+    "note": "kaikki.org regenerates this file in place; a later download has a new sha256 and the build refuses it until this pin is updated."
+  }
+}
