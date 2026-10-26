@@ -48,9 +48,20 @@ def schema(db):
     -- One row per noun. genders: 'm', 'f', 'n' or several ('m,n'). Its case
     -- forms are the forms rows with this lemma id (tags nom_sg … akk_pl).
     CREATE TABLE nouns (id INTEGER PRIMARY KEY REFERENCES lemmas(id), genders TEXT NOT NULL);
-    -- One row per sense (WikDict). hom: homograph number (See 1 = der, See 2 = die).
+    -- One row per distinct sense (WikDict): senses of one homograph with the same
+    -- English translations are merged, their German definitions joined with ' | '.
+    -- hom: homograph number (See 1 = lake, See 2 = sea).
     CREATE TABLE senses (lemma TEXT NOT NULL, pos TEXT NOT NULL, hom INTEGER NOT NULL, num TEXT,
                          definition TEXT, translations TEXT NOT NULL, importance REAL);
+    -- Gender and plural of each noun homograph (See 1 = m 'Seen', See 2 = f 'Seen';
+    -- Bank 1 = f 'Bänke', Bank 2 = f 'Banken'), matched to German Wiktionary by
+    -- definition text; a lone homograph with no match takes the noun data's gender
+    -- when that is unambiguous. Missing otherwise.
+    CREATE TABLE homographs (lemma TEXT NOT NULL, hom INTEGER NOT NULL, genders TEXT NOT NULL, plural TEXT,
+                             PRIMARY KEY (lemma, hom));
+    -- One row per adjective: comparative and superlative ('besser', 'am besten').
+    -- Its declined forms are forms rows (tags 'pos', 'comp', 'sup').
+    CREATE TABLE adjectives (id INTEGER PRIMARY KEY REFERENCES lemmas(id), comparative TEXT, superlative TEXT);
     -- One row per verb. aux: 'haben', 'sein', or both with the usual one
     -- first ('sein,haben' for fahren), in Wiktionary's order. prefix: separable
     -- particle ('an' for anrufen) or ''. weak: 1 = regular (-te, ge-…-t), 0 = strong or mixed.
@@ -105,18 +116,59 @@ def build_nouns(db, path):
     return n
 
 
-def build_senses(db, path):
+def norm(text):
+    """A definition without its leading labels ('Geografie: …'), lowercased, for matching."""
+    text = re.sub(r"^(?:[^:]{1,60}:\s*)+", "", text or "")
+    return re.sub(r"\W+", " ", text).strip().lower()
+
+
+def build_senses(db, path, noun_entries):
     src = sqlite3.connect(path)
-    n = 0
+    groups = {}
     for lexentry, num, sense, trans, imp in src.execute(
             "SELECT lexentry, sense_num, sense, trans_list, importance FROM translation "
             "WHERE lexentry IS NOT NULL ORDER BY lexentry, sense_num"):
         parts = lexentry.split("/", 1)[1].split("__")
         lemma, pos = parts[0], parts[1]
         hom = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
-        db.execute("INSERT INTO senses VALUES (?,?,?,?,?,?,?)", (lemma, pos, hom, num, sense, trans, imp))
-        n += 1
-    return n
+        g = groups.setdefault((lemma, pos, hom, trans), [num, [], imp])
+        if sense and sense not in g[1]:
+            g[1].append(sense)
+        g[2] = max(g[2] or 0, imp or 0)
+    rows = 0
+    for (lemma, pos, hom, trans), (num, defs, imp) in groups.items():
+        db.execute("INSERT INTO senses VALUES (?,?,?,?,?,?,?)", (lemma, pos, hom, num, " | ".join(defs), trans, imp))
+        rows += 1
+    raw = src.execute("SELECT count(*) FROM translation WHERE lexentry IS NOT NULL").fetchone()[0]
+    # link each noun homograph to the Wiktionary entry whose glosses match its definitions
+    linked = unmatched = 0
+    homs = {}
+    for (lemma, pos, hom, _), (_, defs, _) in groups.items():
+        if pos == "Substantiv":
+            homs.setdefault(lemma, {}).setdefault(hom, set()).update(norm(d)[:40] for d in defs if norm(d))
+    for lemma, by_hom in homs.items():
+        entries = noun_entries.get(lemma, [])
+        for hom, defs in sorted(by_hom.items()):
+            best, score = None, 0
+            for genders, plural, glosses in entries:
+                sc = sum(1 for d in defs if any(d in gl or gl[:40] in d for gl in glosses))
+                if sc > score:
+                    best, score = (genders, plural), sc
+            if best is None and len(by_hom) == 1 and len({e[0] for e in entries}) == 1:
+                best = entries[0][:2]  # one homograph, one gender: nothing to tell apart
+            if best is None and len(by_hom) == 1:
+                # no Wiktionary entry matched: the noun data decides when it knows one gender
+                known = db.execute("SELECT DISTINCT n.genders, n.id FROM lemmas l JOIN nouns n ON n.id = l.id "
+                                   "WHERE l.lemma = ? AND l.pos = 'noun'", (lemma,)).fetchall()
+                if len({k[0] for k in known}) == 1:
+                    pl = db.execute("SELECT form FROM forms WHERE id = ? AND tags LIKE '%nom_pl%'", (known[0][1],)).fetchone()
+                    best = (known[0][0], pl[0] if pl else None)
+            if best:
+                db.execute("INSERT INTO homographs VALUES (?,?,?,?)", (lemma, hom, best[0], best[1]))
+                linked += 1
+            else:
+                unmatched += 1
+    return {"senses": rows, "senses_merged": raw - rows, "homographs": linked, "homographs_unmatched": unmatched}
 
 
 def strip_pronoun(form):
@@ -131,14 +183,63 @@ def is_weak(lemma, prefix, past_ich, part2):
     return int(past in (stem + "te", stem + "ete") and (part2 or "").endswith("t"))
 
 
-def build_verbs(db, path):
-    n = 0
+GENDER = {"masculine": "m", "feminine": "f", "neuter": "n"}
+DEGREE = {"positive": "pos", "comparative": "comp", "superlative": "sup"}
+
+
+def add_adjective(db, e):
+    if any(s.get("form_of") for s in e.get("senses", [])):
+        return False
+    summary = {tuple(x.get("tags") or []): x["form"] for x in e.get("forms", []) if "source" not in x}
+    if ("positive",) not in summary:
+        return False
+    lid = db.execute("INSERT INTO lemmas (lemma, pos) VALUES (?, 'adj')", (e["word"],)).lastrowid
+    db.execute("INSERT INTO adjectives VALUES (?,?,?)", (lid, summary.get(("comparative",)), summary.get(("superlative",))))
+    by_form = {e["word"]: ["pos"]}
+    for x in e.get("forms", []):
+        t = x.get("tags") or []
+        deg = next((DEGREE[d] for d in DEGREE if d in t), None)
+        w = x["form"].removeprefix("am ")
+        if deg and " " not in w and deg not in by_form.setdefault(w, []):
+            by_form[w].append(deg)
+    db.executemany("INSERT INTO forms VALUES (?,?,?, '')", [(w, lid, ",".join(t)) for w, t in by_form.items() if t])
+    return True
+
+
+def noun_entry(e):
+    """(genders, nominative plural, normalised glosses) of a Wiktionary noun entry."""
+    if any(s.get("form_of") for s in e.get("senses", [])):
+        return None
+    genders = ",".join(dict.fromkeys(GENDER[t] for t in e.get("tags") or [] if t in GENDER))
+    if not genders:
+        return None
+    plural = next((x["form"] for x in e.get("forms", []) if "source" not in x
+                   and (x.get("tags") or []) == ["nominative", "plural"]), None)
+    if plural:
+        plural = plural.removeprefix("die ")
+    glosses = [norm(g) for s in e.get("senses", []) for g in s.get("glosses", []) if norm(g)]
+    return genders, plural, glosses
+
+
+def build_wiktionary(db, path):
+    n = adjectives = 0
+    noun_entries = {}
     with gzip.open(path, "rt", encoding="utf-8") as f:
         for line in f:
-            if '"lang_code": "de"' not in line or '"pos": "verb"' not in line:
+            if '"lang_code": "de"' not in line:
                 continue
             e = json.loads(line)
-            if e.get("lang_code") != "de" or e.get("pos") != "verb":
+            if e.get("lang_code") != "de":
+                continue
+            if e.get("pos") == "adj":
+                adjectives += add_adjective(db, e)
+                continue
+            if e.get("pos") in ("noun", "name"):
+                ne = noun_entry(e)
+                if ne:
+                    noun_entries.setdefault(e["word"], []).append(ne)
+                continue
+            if e.get("pos") != "verb":
                 continue
             summary = [x for x in e.get("forms", []) if "source" not in x]
             def first(*tags, pron=None):
@@ -202,7 +303,7 @@ def build_verbs(db, path):
             db.executemany("INSERT INTO forms VALUES (?,?,?,?)",
                            [(w, lid, ",".join(t), p) for (w, p), t in by_form.items()])
             n += 1
-    return n
+    return {"verbs": n, "adjectives": adjectives}, noun_entries
 
 
 def main():
@@ -220,9 +321,10 @@ def main():
         os.remove(db_path)
     db = sqlite3.connect(db_path)
     schema(db)
-    counts = {"nouns": build_nouns(db, sources["nouns"]["path"]),
-              "senses": build_senses(db, sources["senses"]["path"]),
-              "verbs": build_verbs(db, sources["verbs"]["path"])}
+    counts = {"nouns": build_nouns(db, sources["nouns"]["path"])}
+    wk, noun_entries = build_wiktionary(db, sources["verbs"]["path"])
+    counts.update(wk)
+    counts.update(build_senses(db, sources["senses"]["path"], noun_entries))
     counts["forms"] = db.execute("SELECT count(*) FROM forms").fetchone()[0]
     db.executescript("""
     CREATE INDEX forms_form ON forms(form);
@@ -231,7 +333,7 @@ def main():
     CREATE INDEX senses_lemma ON senses(lemma);
     """)
     built = datetime.date.today().isoformat()
-    meta = {"pack": "dict:de-en", "version": str(a.version), "schema": "1", "built": built,
+    meta = {"pack": "dict:de-en", "version": str(a.version), "schema": "2", "built": built,
             "licence": "CC BY-SA 4.0", "licence_url": "https://creativecommons.org/licenses/by-sa/4.0/",
             "changes": "Filtered, trimmed, merged and restructured from the sources; no entry text rewritten.",
             "credits": open(os.path.join(HERE, "..", "NOTICE.md"), encoding="utf-8").read(),
@@ -243,7 +345,7 @@ def main():
     gz_path = db_path + ".gz"
     with open(db_path, "rb") as fi, gzip.GzipFile(gz_path, "wb", compresslevel=9, mtime=0) as fo:
         shutil.copyfileobj(fi, fo)
-    manifest = {"pack": "dict:de-en", "version": a.version, "schema": 1, "built": built,
+    manifest = {"pack": "dict:de-en", "version": a.version, "schema": 2, "built": built,
                 "file": os.path.basename(gz_path), "size": os.path.getsize(gz_path), "sha256": sha256(gz_path),
                 "sqlite_size": os.path.getsize(db_path), "sqlite_sha256": sha256(db_path),
                 "counts": counts, "licence": "CC BY-SA 4.0",

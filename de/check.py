@@ -74,6 +74,37 @@ for w, wants in SENSES.items():
 see = {x[0]: x[1] for x in db.execute("SELECT hom, translations FROM senses WHERE lemma = 'See'")}
 check("lake" in see.get(1, "") and "sea" in see.get(2, ""), f"senses See homographs: {see}")
 
+# adjectives: form -> lemma with degree; comparative / superlative
+ADJ_FORMS = {"kleinen": ("klein", "pos"), "größten": ("groß", "sup"), "besser": ("gut", "comp"),
+             "höheren": ("hoch", "comp"), "gemütliches": ("gemütlich", "pos")}
+for f, (lemma, deg) in ADJ_FORMS.items():
+    tags = [x[0] for x in db.execute("SELECT f.tags FROM forms f JOIN lemmas l ON l.id = f.id "
+                                     "WHERE f.form = ? AND l.lemma = ? AND l.pos = 'adj'", (f, lemma))]
+    check(any(deg in t.split(",") for t in tags), f"adj form {f}: {lemma}/{deg} not in {tags}")
+ADJ = {"gut": ("besser", "am besten"), "hoch": ("höher", "am höchsten"), "groß": ("größer", "am größten")}
+for a, want in ADJ.items():
+    got = db.execute("SELECT a.comparative, a.superlative FROM adjectives a JOIN lemmas l ON l.id = a.id WHERE l.lemma = ?", (a,)).fetchone()
+    check(got == want, f"adj {a}: {got} != {want}")
+
+# noun homographs: gender and plural per homograph
+HOMS = {("See", 1): ("m", "Seen"), ("See", 2): ("f", "Seen"), ("Leiter", 1): ("m", "Leiter"), ("Leiter", 2): ("f", "Leitern"),
+        ("Bank", 1): ("f", "Bänke"), ("Bank", 2): ("f", "Banken"), ("Steuer", 1): ("n", "Steuer"), ("Steuer", 2): ("f", "Steuern"),
+        ("Tor", 1): ("n", "Tore"), ("Tor", 2): ("m", "Toren"), ("Band", 2): ("m", "Bände"), ("Band", 3): ("f", "Bands")}
+for (lemma, hom), want in HOMS.items():
+    got = db.execute("SELECT genders, plural FROM homographs WHERE lemma = ? AND hom = ?", (lemma, hom)).fetchone()
+    check(got == want, f"homograph {lemma} {hom}: {got} != {want}")
+total = db.execute("SELECT count(*) FROM (SELECT DISTINCT lemma, hom FROM senses WHERE pos = 'Substantiv')").fetchone()[0]
+linked = db.execute("SELECT count(*) FROM homographs").fetchone()[0]
+print(f"noun homographs with a gender: {linked}/{total} = {linked / total:.0%}")
+check(linked / total >= 0.9, f"homograph link rate {linked / total:.0%} < 90%")
+check(not db.execute("SELECT 1 FROM homographs WHERE plural LIKE 'die %' LIMIT 1").fetchone(), "homograph plural with article")
+
+# senses: no two rows of one homograph with the same translations
+dup = db.execute("SELECT count(*) FROM (SELECT 1 FROM senses GROUP BY lemma, pos, hom, translations HAVING count(*) > 1)").fetchone()[0]
+check(dup == 0, f"senses: {dup} duplicate translation groups")
+haus = [x[0] for x in db.execute("SELECT translations FROM senses WHERE lemma = 'Haus' AND pos = 'Substantiv'")]
+check(haus.count("house | home") == 1, f"senses Haus: {haus}")
+
 # coverage of the sample text: a token counts when it is a known form or lemma
 text = open(__file__.replace("check.py", "check-text.txt"), encoding="utf-8").read()
 toks = re.findall(r"[A-Za-zÄÖÜäöüßé]+", text)
@@ -89,7 +120,8 @@ check(cov >= 0.9, f"coverage {cov:.0%} < 90%")
 meta = dict(db.execute("SELECT key, value FROM meta"))
 check(meta.get("licence") == "CC BY-SA 4.0" and "Wiktionary" in meta.get("credits", ""), "meta: licence/credits missing")
 
-checks = len(VERBS) * 5 + len(WEAK) + len(NOUNS) * 2 + len(FORMS) + 1 + sum(map(len, SENSES.values())) + 3
+checks = (len(VERBS) * 5 + len(WEAK) + len(NOUNS) * 2 + len(FORMS) + 1 + sum(map(len, SENSES.values())) + 3
+          + len(ADJ_FORMS) + len(ADJ) + len(HOMS) + 4)
 print(f"{checks - len(fails)}/{checks} checks passed")
 for f in fails:
     print("FAIL", f)
